@@ -1,0 +1,270 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+const int SENSOR_PIN = 34;
+const int RELAY_PIN = 23;
+const int RESET_BTN = 25;
+
+// Relay State Correction Macros (Active Low support)
+#define RELAY_ON  LOW
+#define RELAY_OFF HIGH
+
+const char* ssid = "v1";
+const char* password = "26092007";
+
+WebServer server(80);
+
+bool deviceState = false;     // relay commanded state (user/auto controlled)
+bool autoShutoff  = false;    // true if last OFF was due to idle auto-cutoff
+float totalKWh = 0.0;
+float tariffRate = 6.0;
+unsigned long previousMillis = 0;
+int baselineAdc = 2048;
+
+float dailyKWh = 0.0;
+float monthlyKWh = 0.0;
+float savedKWh = 1.25;
+
+// ---- Noise / load detection ----
+long noiseFloorAdc = 0;          // calibrated at boot: max peak-to-peak noise with no load
+const int NOISE_MARGIN = 8;      // extra ADC counts of safety margin above measured noise
+float smoothedAmps = 0.0;        // EMA-smoothed current reading
+const float EMA_ALPHA = 0.3;     // smoothing factor (higher = more responsive, less smooth)
+const float MIN_REPORT_AMPS = 0.03; // anything below this is reported as exactly 0
+
+// live (only meaningful when a load is actually detected)
+float liveVoltage = 0.0;
+float liveCurrent = 0.0;
+float livePowerW  = 0.0;
+bool loadPresent   = false;      // true only when real current is flowing right now
+
+// ---- Auto shutoff on idle ----
+const unsigned long AUTO_OFF_TIMEOUT = 30000; // ms of no-load before auto turning relay off
+unsigned long idleStartMillis = 0;
+bool idleTimerRunning = false;
+
+// ---- LCD page rotation ----
+const unsigned long LCD_PAGE_INTERVAL = 3000; // ms per page
+
+void handleToggle() {
+  deviceState = !deviceState;
+  autoShutoff = false; // manual action clears the auto-shutoff flag
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleResetStats() {
+  totalKWh = 0.0;
+  dailyKWh = 0.0;
+  monthlyKWh = 0.0;
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+String statusLabel() {
+  if (!deviceState) {
+    return autoShutoff ? "OFF (Auto - Idle)" : "OFF";
+  }
+  return loadPresent ? "ACTIVE [ON]" : "STANDBY (No Load)";
+}
+
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<meta http-equiv='refresh' content='5'>";
+  html += "<script src='https://cdn.jsdelivr.net/npm/chart.js'></script>";
+  html += "<style>body{font-family:Arial;background:#0f172a;color:white;text-align:center;padding:15px;}";
+  html += ".card{background:#1e293b;padding:15px;border-radius:10px;margin:10px auto;max-width:400px;border:1px solid #334155;}";
+  html += "canvas{background:#0f172a;border-radius:8px;margin-top:10px;width:100% !important;height:200px !important;}";
+  html += ".btn{background:#3b82f6;color:white;border:none;padding:10px 20px;border-radius:5px;cursor:pointer;font-weight:bold;margin-top:10px;text-decoration:none;display:inline-block;}";
+  html += ".btn-danger{background:#ef4444;margin-left:10px;}";
+  html += ".pill{display:inline-block;padding:4px 10px;border-radius:12px;font-size:13px;margin-top:6px;}";
+  html += ".on{background:#166534;} .standby{background:#854d0e;} .off{background:#7f1d1d;}</style></head>";
+  html += "<body><h2>&#9889; Smart Grid Dashboard (ESP32)</h2>";
+
+  html += "<div class='card'>";
+  html += "<p>Status: <b>" + statusLabel() + "</b></p>";
+  html += "<p>Voltage: <b>" + String(loadPresent ? liveVoltage : 0.0, 1) + " V</b> &nbsp; ";
+  html += "Current: <b>" + String(loadPresent ? liveCurrent : 0.0, 2) + " A</b> &nbsp; ";
+  html += "Power: <b>" + String(loadPresent ? livePowerW : 0.0, 1) + " W</b></p>";
+  html += "<p>Total Units: <b>" + String(totalKWh, 4) + " kWh</b></p>";
+  html += "<p>Est. Bill: <b>Rs " + String(totalKWh * tariffRate, 2) + "</b></p>";
+  html += "<p>Power Saved: <b style='color:#4ade80;'>" + String(savedKWh, 3) + " kWh</b></p>";
+  html += "<a href='/toggle' class='btn'>" + String(deviceState ? "Turn OFF" : "Turn ON") + "</a>";
+  html += "<a href='/reset' class='btn btn-danger'>Reset Stats</a>";
+  html += "</div>";
+
+  html += "<div class='card'>";
+  html += "<h3>Usage Analytics</h3>";
+  html += "<p>Daily Use: <b>" + String(dailyKWh, 3) + " kWh</b></p>";
+  html += "<p>Monthly Use: <b>" + String(monthlyKWh, 3) + " kWh</b></p>";
+  html += "<canvas id='usageChart'></canvas>";
+  html += "</div>";
+
+  html += "<script>";
+  html += "const ctx = document.getElementById('usageChart').getContext('2d');";
+  html += "new Chart(ctx, { type: 'bar', data: { labels: ['Daily', 'Monthly'], datasets: [{ label: 'Energy (kWh)', data: [" + String(dailyKWh, 4) + ", " + String(monthlyKWh, 4) + "], backgroundColor: ['#38bdf8', '#818cf8'] }] }, options: { responsive: false, maintainAspectRatio: false, scales: { y: { beginAtZero: true } } } });";
+  html += "</script>";
+
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+// Measures peak-to-peak ADC swing over one sampling window
+long samplePeakToPeak() {
+  int mx = 0, mn = 4095;
+  for (int i = 0; i < 300; i++) {
+    int val = analogRead(SENSOR_PIN);
+    if (val > mx) mx = val;
+    if (val < mn) mn = val;
+    delayMicroseconds(200);
+  }
+  return mx - mn;
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(RESET_BTN, INPUT_PULLUP);
+  digitalWrite(RELAY_PIN, RELAY_OFF);
+
+  Wire.begin(21, 22);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Calibrating...");
+
+  long sum = 0;
+  for (int i = 0; i < 500; i++) {
+    sum += analogRead(SENSOR_PIN);
+    delay(2);
+  }
+  baselineAdc = sum / 500;
+
+  // ---- Noise floor calibration (relay is OFF here, so this is true "no load" noise) ----
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Noise calib...");
+  long maxNoiseDiff = 0;
+  for (int w = 0; w < 20; w++) {
+    long diff = samplePeakToPeak();
+    if (diff > maxNoiseDiff) maxNoiseDiff = diff;
+  }
+  noiseFloorAdc = maxNoiseDiff + NOISE_MARGIN;
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Smart Grid Ready");
+  delay(1500);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  server.on("/", handleRoot);
+  server.on("/toggle", handleToggle);
+  server.on("/reset", handleResetStats);
+  server.begin();
+  previousMillis = millis();
+}
+
+void loop() {
+  server.handleClient();
+
+  long diff = samplePeakToPeak();
+
+  // Anything at or below the calibrated noise floor is treated as exactly zero.
+  long peakDiff = (diff > noiseFloorAdc) ? diff : 0;
+
+  float rawVoltage = (peakDiff * 3.3) / 4095.0;
+  float rawCurrent = rawVoltage / 0.185;
+
+  // Smooth to avoid flicker, then hard-zero anything negligible.
+  smoothedAmps = (EMA_ALPHA * rawCurrent) + ((1.0 - EMA_ALPHA) * smoothedAmps);
+  float currentAmps = (smoothedAmps < MIN_REPORT_AMPS) ? 0.0 : smoothedAmps;
+
+  float powerWatts = currentAmps * 230.0;
+  loadPresent = (currentAmps > 0.0) && deviceState;
+
+  liveVoltage = 230.0; // mains reference; swap for a real voltage sensor reading if you add one
+  liveCurrent = currentAmps;
+  livePowerW  = powerWatts;
+
+  unsigned long currentMillis = millis();
+  float elapsedSeconds = (currentMillis - previousMillis) / 1000.0;
+  previousMillis = currentMillis;
+
+  if (loadPresent) {
+    float addedKWh = (powerWatts * elapsedSeconds) / 3600000.0;
+    totalKWh += addedKWh;
+    dailyKWh += addedKWh;
+    monthlyKWh += addedKWh;
+  }
+
+  float billAmount = totalKWh * tariffRate;
+
+  // Manual physical button toggle override
+  if (digitalRead(RESET_BTN) == LOW) {
+    deviceState = !deviceState;
+    autoShutoff = false;
+    delay(500);
+  }
+
+  // ---- Auto shutoff when relay is ON but socket sits idle (no load) ----
+  if (deviceState && !loadPresent) {
+    if (!idleTimerRunning) {
+      idleStartMillis = currentMillis;
+      idleTimerRunning = true;
+    } else if (currentMillis - idleStartMillis >= AUTO_OFF_TIMEOUT) {
+      deviceState = false;
+      autoShutoff = true;
+      idleTimerRunning = false;
+    }
+  } else {
+    idleTimerRunning = false;
+  }
+
+  // Safety Overload Trip (above 10 Amps)
+  if (currentAmps > 10.0) {
+    deviceState = false;
+    autoShutoff = false;
+    digitalWrite(RELAY_PIN, RELAY_OFF);
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("DISASTER CUT!");
+    delay(2000);
+    return;
+  }
+
+  // Apply correct state to relay module
+  digitalWrite(RELAY_PIN, deviceState ? RELAY_ON : RELAY_OFF);
+
+  // ---- LCD: rotate between live status and usage summary ----
+  int page = (currentMillis / LCD_PAGE_INTERVAL) % 2;
+  lcd.clear();
+  if (page == 0) {
+    lcd.setCursor(0, 0);
+    lcd.print("U:" + String(totalKWh, 3) + " I:" + String(currentAmps, 2) + "A");
+    lcd.setCursor(0, 1);
+    if (!deviceState) {
+      lcd.print(autoShutoff ? "Rs:" + String(billAmount, 2) + " AutoOFF" : "Rs:" + String(billAmount, 2) + " [OFF]");
+    } else {
+      lcd.print("Rs:" + String(billAmount, 2) + (loadPresent ? " [ON]" : " [IDLE]"));
+    }
+  } else {
+    lcd.setCursor(0, 0);
+    lcd.print("Day:" + String(dailyKWh, 2) + "kWh");
+    lcd.setCursor(0, 1);
+    lcd.print("Mon:" + String(monthlyKWh, 2) + "kWh");
+  }
+
+  delay(400);
+}
